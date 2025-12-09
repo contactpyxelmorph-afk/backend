@@ -1,0 +1,29 @@
+{
+  "users": [
+    {
+      "username": "freeuser",
+      "password": "freepass",
+      "type": "free"
+    },
+    {
+      "username": "La_Furia",
+      "password": "dei_miracoli",
+      "type": "admin"
+    },
+    {
+      "username": "prouser",
+      "password": "propass",
+      "type": "pro"
+    },
+    {
+      "username": "diamond",
+      "password": "diamondpass",
+      "type": "diamond"
+    },
+    {
+      "username": "admin",
+      "password": "adminpass",
+      "type": "admin"
+    }
+  ]
+}

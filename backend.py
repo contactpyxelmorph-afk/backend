@@ -1,198 +1,92 @@
 # backend.py
 from flask import Flask, request, jsonify
-import json
-import base64
-import hashlib
-import os
+import json, os, hashlib, base64
 from datetime import datetime, timedelta
 import stripe
 
 app = Flask(__name__)
 
-# 1️⃣ Strict environment enforcement
+# --- 1️⃣ Environment & Stripe keys ---
 if not os.getenv("RENDER"):
-    raise RuntimeError("FATAL: Backend allowed only on Render.")
-
-# 2️⃣ Load Stripe LIVE key
-stripe_key = os.getenv("STRIPE_SECRET_KEY_LIVE")
-if not stripe_key or not stripe_key.startswith("sk_live_"):
-    raise RuntimeError(f"Invalid Stripe LIVE key: {stripe_key}")
-stripe.api_key = stripe_key
-
-# 3️⃣ Webhook + License secrets
+    raise RuntimeError("Must run on Render")
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY_LIVE")
 WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 LICENSE_SECRET = os.getenv("LICENSE_SECRET")
-if not WEBHOOK_SECRET or not LICENSE_SECRET:
-    raise RuntimeError("WEBHOOK_SECRET and LICENSE_SECRET required.")
-
-# 4️⃣ User storage
 USERS_FILE = "users.json"
+
+# --- 2️⃣ Load / save users ---
 def load_users():
-    try:
-        with open(USERS_FILE, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-def save_users(users):
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
+    try: return json.load(open(USERS_FILE))
+    except: return {}
+def save_users(u): json.dump(u, open(USERS_FILE,"w"), indent=2)
 
-# 5️⃣ Tier → Stripe Price IDs
-TIER_PRICE_IDS = {
-    "pro": os.getenv("PRICE_PRO_ID"),
-    "diamond": os.getenv("PRICE_DIAMOND_ID")
-}
+# --- 3️⃣ License generator ---
+def gen_license(tier):
+    exp = (datetime.utcnow() + timedelta(days=30)).strftime("%Y%m%d")
+    sig = hashlib.sha256(f"{tier}|{exp}|{LICENSE_SECRET}".encode()).hexdigest()
+    return base64.urlsafe_b64encode(f"{tier}|{exp}|{sig}".encode()).decode(), exp
 
-# 6️⃣ License generator
-def generate_license(tier_code, duration_days=30):
-    expiry = (datetime.utcnow() + timedelta(days=duration_days)).strftime("%Y%m%d")
-    sig = hashlib.sha256(f"{tier_code}|{expiry}|{LICENSE_SECRET}".encode()).hexdigest()
-    raw = f"{tier_code}|{expiry}|{sig}"
-    return base64.urlsafe_b64encode(raw.encode()).decode()
-
-# 7️⃣ Create checkout session
+# --- 4️⃣ Create checkout session ---
 @app.route("/create_checkout_session", methods=["POST"])
 def create_checkout():
     data = request.json
     username = data.get("username")
-    tier = data.get("tier", "").lower()
-
-    if not username:
-        return jsonify({"error": "Username required"}), 400
-    if tier not in TIER_PRICE_IDS or not TIER_PRICE_IDS[tier]:
-        return jsonify({"error": f"Invalid tier '{tier}'"}), 400
-
+    tier = data.get("tier")
+    if not username or not tier: return jsonify({"error":"Missing"}),400
+    price_id = os.getenv(f"PRICE_{tier.upper()}_ID")
     try:
-        session = stripe.checkout.Session.create(
+        sess = stripe.checkout.Session.create(
             payment_method_types=["card"],
-            line_items=[{"price": TIER_PRICE_IDS[tier], "quantity": 1}],
+            line_items=[{"price": price_id,"quantity":1}],
             mode="subscription",
-            success_url=os.getenv(
-                "SUCCESS_URL",
-                "https://cheery-raindrop-569ebe.netlify.app/success.html?session_id={CHECKOUT_SESSION_ID}"
-            ),
-            cancel_url=os.getenv(
-                "CANCEL_URL",
-                "https://cheery-raindrop-569ebe.netlify.app/cancel.html"
-            )
+            success_url=os.getenv("SUCCESS_URL"),
+            cancel_url=os.getenv("CANCEL_URL"),
+            metadata={"username":username,"tier":tier}
         )
+        users = load_users()
+        users[username] = {"checkout_session_id":sess.id,"pending_tier":tier}
+        save_users(users)
+        return jsonify({"checkout_url": sess.url})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)}),500
 
-    # Store pending tier and session ID
-    users = load_users()
-    if username not in users:
-        users[username] = {}
-    users[username]["checkout_session_id"] = session.id
-    users[username]["pending_tier"] = tier
-    save_users(users)
-
-    return jsonify({"checkout_url": session.url})
-
-# 8️⃣ Stripe webhook
+# --- 5️⃣ Stripe webhook ---
 @app.route("/webhook", methods=["POST"])
 def webhook():
     payload = request.data
-    sig_header = request.headers.get("stripe-signature")
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
-    except Exception as e:
-        return f"Webhook signature verification failed: {e}", 400
+    sig = request.headers.get("stripe-signature")
+    try: event = stripe.Webhook.construct_event(payload,sig,WEBHOOK_SECRET)
+    except: return "Bad signature",400
 
-    evt_type = event.get("type")
-    users = load_users()
-
-    def upgrade_user(session_id):
-        for username, data in users.items():
-            if data.get("checkout_session_id") == session_id:
+    def upgrade(sess_id):
+        users = load_users()
+        for u,data in users.items():
+            if data.get("checkout_session_id")==sess_id:
                 tier = data.get("pending_tier")
-                if not tier:
-                    return False
-                license_key = generate_license(tier, 30)
-                expiry_date = (datetime.utcnow() + timedelta(days=30)).strftime("%Y-%m-%d")
-                users[username]["tier"] = tier
-                users[username]["license_key"] = license_key
-                users[username]["expires"] = expiry_date
-                users[username].pop("pending_tier", None)
-                users[username].pop("checkout_session_id", None)
+                if not tier: return
+                lic, exp = gen_license(tier)
+                users[u].update({"tier":tier,"license_key":lic,"expires":exp})
+                users[u].pop("pending_tier",None)
+                users[u].pop("checkout_session_id",None)
                 save_users(users)
-                return True
-        return False
+                return
+    et = event["type"]
 
-    # 1️⃣ Paid checkout session
-    if evt_type == "checkout.session.completed":
-        session = event["data"]["object"]
-        session_id = session.get("id")
-        payment_status = session.get("payment_status")
-        subscription_id = session.get("subscription")
+    # Only upgrade after payment is confirmed
+    if et in ("checkout.session.completed","checkout.session.async_payment_succeeded",
+              "invoice.paid","invoice.payment_succeeded"):
+        sess_id = event["data"]["object"].get("id") or event["data"]["object"].get("checkout_session")
+        if sess_id:
+            upgrade(sess_id)
+    return "",200
 
-        if payment_status == "paid":
-            upgrade_user(session_id)
-        elif subscription_id:
-            sub = stripe.Subscription.retrieve(subscription_id, expand=["latest_invoice"])
-            latest_invoice = sub.get("latest_invoice")
-            if latest_invoice and latest_invoice.get("status") == "paid":
-                upgrade_user(session_id)
-        return "", 200
-
-    # 2️⃣ Invoice payments
-    if evt_type in ("invoice.paid", "invoice.payment_succeeded"):
-        invoice = event["data"]["object"]
-        checkout_session_id = invoice.get("checkout_session")
-        if checkout_session_id:
-            upgrade_user(checkout_session_id)
-        return "", 200
-
-    # 3️⃣ Async payment succeeded
-    if evt_type == "checkout.session.async_payment_succeeded":
-        session = event["data"]["object"]
-        upgrade_user(session.get("id"))
-        return "", 200
-
-    # 4️⃣ Payment failed — do not upgrade
-    if evt_type in ("invoice.payment_failed", "checkout.session.async_payment_failed"):
-        return "", 200
-
-    # Ignore all other events
-    return "", 200
-
-# 9️⃣ License status
+# --- 6️⃣ Get user status ---
 @app.route("/get_status", methods=["GET"])
 def get_status():
-    username = request.args.get("user")
-    users = load_users()
-    u = users.get(username)
-    if not u or "tier" not in u:
-        return jsonify({"tier": "free"})
-    return jsonify({
-        "tier": u.get("tier"),
-        "license_key": u.get("license_key"),
-        "expires": u.get("expires")
-    })
+    u = load_users().get(request.args.get("user"))
+    if not u or "tier" not in u: return jsonify({"tier":"free"})
+    return jsonify({"tier":u["tier"],"license_key":u["license_key"],"expires":u["expires"]})
 
-# 🔟 Health check
-@app.route("/health", methods=["GET"])
-def health():
-    missing = []
-    if not stripe.api_key:
-        missing.append("stripe.api_key")
-    if not WEBHOOK_SECRET:
-        missing.append("WEBHOOK_SECRET")
-    if not LICENSE_SECRET:
-        missing.append("LICENSE_SECRET")
-    return jsonify({
-        "status": "ok" if not missing else "error",
-        "loaded_env": {
-            "stripe_key_preview": stripe.api_key[:6] + "..." + stripe.api_key[-4:],
-            "price_pro": TIER_PRICE_IDS.get("pro"),
-            "price_diamond": TIER_PRICE_IDS.get("diamond")
-        },
-        "missing": missing
-    })
-
-# 🔹 Run app
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    print("RUNNING ON RENDER WITH STRICT ENV CHECK.")
-    print(f"Stripe key preview: {stripe_key[:12]}...")
-    app.run(host="0.0.0.0", port=port, debug=False)
+# --- 7️⃣ Run ---
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)), debug=False)

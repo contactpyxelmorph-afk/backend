@@ -1,5 +1,4 @@
 # backend.py
-
 from flask import Flask, request, jsonify
 import json
 import base64
@@ -40,7 +39,7 @@ if not WEBHOOK_SECRET or not LICENSE_SECRET:
     )
 
 ###############################################################################
-# 4️⃣ User file
+# 4️⃣ User storage
 ###############################################################################
 USERS_FILE = "users.json"
 
@@ -83,12 +82,10 @@ def create_checkout():
 
     if not username:
         return jsonify({"error": "Username required"}), 400
-
     if tier not in TIER_PRICE_IDS or not TIER_PRICE_IDS[tier]:
         return jsonify({"error": f"Invalid or unset tier '{tier}'"}), 400
 
     price_id = TIER_PRICE_IDS[tier]
-
     try:
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
@@ -106,7 +103,7 @@ def create_checkout():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Store pending tier until payment is confirmed
+    # Save pending tier and session ID
     users = load_users()
     if username not in users:
         users[username] = {}
@@ -117,13 +114,12 @@ def create_checkout():
     return jsonify({"checkout_url": session.url})
 
 ###############################################################################
-# 8️⃣ Stripe webhook
+# 8️⃣ Stripe webhook: only upgrade when payment is confirmed
 ###############################################################################
 @app.route("/webhook", methods=["POST"])
 def webhook():
     payload = request.data
     sig_header = request.headers.get("stripe-signature")
-
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
     except Exception as e:
@@ -141,7 +137,6 @@ def webhook():
                 users[username]["tier"] = tier
                 users[username]["license_key"] = license_key
                 users[username]["expires"] = expiry_date
-                # Remove temporary session info
                 users[username].pop("pending_tier", None)
                 users[username].pop("checkout_session_id", None)
                 save_users(users)
@@ -150,13 +145,14 @@ def webhook():
 
     evt_type = event.get("type")
 
-    # ✅ Handle checkout session completed
+    # Upgrade only when Stripe confirms money received
     if evt_type == "checkout.session.completed":
         session = event["data"]["object"]
-        session_id = session.get("id")
         payment_status = session.get("payment_status")
         subscription_id = session.get("subscription")
+        session_id = session.get("id")
 
+        # Only if payment_status is 'paid' or subscription has latest invoice paid
         if payment_status == "paid":
             upgrade_user(session_id)
         elif subscription_id:
@@ -166,7 +162,7 @@ def webhook():
                 upgrade_user(session_id)
         return "", 200
 
-    # ✅ Handle invoice events
+    # Subscription payments: invoice paid events
     if evt_type in ("invoice.paid", "invoice.payment_succeeded"):
         invoice = event["data"]["object"]
         checkout_session_id = invoice.get("checkout_session")
@@ -174,10 +170,17 @@ def webhook():
             upgrade_user(checkout_session_id)
         return "", 200
 
-    # ✅ Payment failed (ignore)
-    if evt_type in ("invoice.payment_failed",):
+    # Payment failed events (do not upgrade)
+    if evt_type in ("invoice.payment_failed", "checkout.session.async_payment_failed"):
         return "", 200
 
+    # Async payment success (subscription)
+    if evt_type == "checkout.session.async_payment_succeeded":
+        session = event["data"]["object"]
+        upgrade_user(session.get("id"))
+        return "", 200
+
+    # Ignore other events
     return "", 200
 
 ###############################################################################
@@ -197,7 +200,7 @@ def get_status():
     })
 
 ###############################################################################
-# 🔟 Health endpoint
+# 🔟 Health check
 ###############################################################################
 @app.route("/health", methods=["GET"])
 def health():

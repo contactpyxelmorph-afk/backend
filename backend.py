@@ -9,71 +9,48 @@ import stripe
 
 app = Flask(__name__)
 
-###############################################################################
-# 1️⃣ Strict environment enforcement — run only on Render
-###############################################################################
+# 1️⃣ Strict environment enforcement
 if not os.getenv("RENDER"):
-    raise RuntimeError(
-        "FATAL: This backend is allowed to run ONLY on Render. "
-        "Environment variable 'RENDER' not found."
-    )
+    raise RuntimeError("FATAL: Backend allowed only on Render.")
 
-###############################################################################
-# 2️⃣ Load Stripe LIVE key ONLY from Render
-###############################################################################
+# 2️⃣ Load Stripe LIVE key
 stripe_key = os.getenv("STRIPE_SECRET_KEY_LIVE")
 if not stripe_key or not stripe_key.startswith("sk_live_"):
-    raise RuntimeError(
-        f"STRIPE_SECRET_KEY_LIVE is missing or invalid: {stripe_key}"
-    )
+    raise RuntimeError(f"Invalid Stripe LIVE key: {stripe_key}")
 stripe.api_key = stripe_key
 
-###############################################################################
-# 3️⃣ Webhook + license secrets
-###############################################################################
+# 3️⃣ Webhook + License secrets
 WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 LICENSE_SECRET = os.getenv("LICENSE_SECRET")
 if not WEBHOOK_SECRET or not LICENSE_SECRET:
-    raise RuntimeError(
-        "STRIPE_WEBHOOK_SECRET and LICENSE_SECRET must be set in Render."
-    )
+    raise RuntimeError("WEBHOOK_SECRET and LICENSE_SECRET required.")
 
-###############################################################################
 # 4️⃣ User storage
-###############################################################################
 USERS_FILE = "users.json"
-
 def load_users():
     try:
         with open(USERS_FILE, "r") as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
-
 def save_users(users):
     with open(USERS_FILE, "w") as f:
         json.dump(users, f, indent=2)
 
-###############################################################################
 # 5️⃣ Tier → Stripe Price IDs
-###############################################################################
 TIER_PRICE_IDS = {
     "pro": os.getenv("PRICE_PRO_ID"),
     "diamond": os.getenv("PRICE_DIAMOND_ID")
 }
 
-###############################################################################
 # 6️⃣ License generator
-###############################################################################
 def generate_license(tier_code, duration_days=30):
     expiry = (datetime.utcnow() + timedelta(days=duration_days)).strftime("%Y%m%d")
     sig = hashlib.sha256(f"{tier_code}|{expiry}|{LICENSE_SECRET}".encode()).hexdigest()
     raw = f"{tier_code}|{expiry}|{sig}"
     return base64.urlsafe_b64encode(raw.encode()).decode()
 
-###############################################################################
 # 7️⃣ Create checkout session
-###############################################################################
 @app.route("/create_checkout_session", methods=["POST"])
 def create_checkout():
     data = request.json
@@ -83,13 +60,12 @@ def create_checkout():
     if not username:
         return jsonify({"error": "Username required"}), 400
     if tier not in TIER_PRICE_IDS or not TIER_PRICE_IDS[tier]:
-        return jsonify({"error": f"Invalid or unset tier '{tier}'"}), 400
+        return jsonify({"error": f"Invalid tier '{tier}'"}), 400
 
-    price_id = TIER_PRICE_IDS[tier]
     try:
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
-            line_items=[{"price": price_id, "quantity": 1}],
+            line_items=[{"price": TIER_PRICE_IDS[tier], "quantity": 1}],
             mode="subscription",
             success_url=os.getenv(
                 "SUCCESS_URL",
@@ -103,7 +79,7 @@ def create_checkout():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Save pending tier and session ID
+    # Store pending tier and session ID
     users = load_users()
     if username not in users:
         users[username] = {}
@@ -113,9 +89,7 @@ def create_checkout():
 
     return jsonify({"checkout_url": session.url})
 
-###############################################################################
-# 8️⃣ Stripe webhook: only upgrade when payment is confirmed
-###############################################################################
+# 8️⃣ Stripe webhook
 @app.route("/webhook", methods=["POST"])
 def webhook():
     payload = request.data
@@ -125,8 +99,10 @@ def webhook():
     except Exception as e:
         return f"Webhook signature verification failed: {e}", 400
 
+    evt_type = event.get("type")
+    users = load_users()
+
     def upgrade_user(session_id):
-        users = load_users()
         for username, data in users.items():
             if data.get("checkout_session_id") == session_id:
                 tier = data.get("pending_tier")
@@ -143,16 +119,13 @@ def webhook():
                 return True
         return False
 
-    evt_type = event.get("type")
-
-    # Upgrade only when Stripe confirms money received
+    # 1️⃣ Paid checkout session
     if evt_type == "checkout.session.completed":
         session = event["data"]["object"]
+        session_id = session.get("id")
         payment_status = session.get("payment_status")
         subscription_id = session.get("subscription")
-        session_id = session.get("id")
 
-        # Only if payment_status is 'paid' or subscription has latest invoice paid
         if payment_status == "paid":
             upgrade_user(session_id)
         elif subscription_id:
@@ -162,7 +135,7 @@ def webhook():
                 upgrade_user(session_id)
         return "", 200
 
-    # Subscription payments: invoice paid events
+    # 2️⃣ Invoice payments
     if evt_type in ("invoice.paid", "invoice.payment_succeeded"):
         invoice = event["data"]["object"]
         checkout_session_id = invoice.get("checkout_session")
@@ -170,22 +143,20 @@ def webhook():
             upgrade_user(checkout_session_id)
         return "", 200
 
-    # Payment failed events (do not upgrade)
-    if evt_type in ("invoice.payment_failed", "checkout.session.async_payment_failed"):
-        return "", 200
-
-    # Async payment success (subscription)
+    # 3️⃣ Async payment succeeded
     if evt_type == "checkout.session.async_payment_succeeded":
         session = event["data"]["object"]
         upgrade_user(session.get("id"))
         return "", 200
 
-    # Ignore other events
+    # 4️⃣ Payment failed — do not upgrade
+    if evt_type in ("invoice.payment_failed", "checkout.session.async_payment_failed"):
+        return "", 200
+
+    # Ignore all other events
     return "", 200
 
-###############################################################################
 # 9️⃣ License status
-###############################################################################
 @app.route("/get_status", methods=["GET"])
 def get_status():
     username = request.args.get("user")
@@ -199,9 +170,7 @@ def get_status():
         "expires": u.get("expires")
     })
 
-###############################################################################
 # 🔟 Health check
-###############################################################################
 @app.route("/health", methods=["GET"])
 def health():
     missing = []
@@ -221,9 +190,7 @@ def health():
         "missing": missing
     })
 
-###############################################################################
 # 🔹 Run app
-###############################################################################
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     print("RUNNING ON RENDER WITH STRICT ENV CHECK.")

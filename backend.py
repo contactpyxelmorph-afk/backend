@@ -79,7 +79,6 @@ def webhook():
 
     event_type = event["type"]
     data = event["data"]["object"]
-
     users = load_users()
 
     # --------------------------
@@ -92,8 +91,6 @@ def webhook():
             if info.get("checkout_session_id") == sess_id:
                 tier = info["pending_tier"]
                 lic, exp = gen_license(tier)
-
-                # Store subscription & customer IDs
                 subscription_id = data.get("subscription")
                 customer_id = data.get("customer")
 
@@ -127,15 +124,13 @@ def webhook():
     # --------------------------
     if event_type in ("customer.subscription.deleted",
                       "customer.subscription.updated"):
-        status = data.get("status")
         subscription_id = data.get("id")
-
-        if status in ("canceled", "unpaid", "incomplete_expired"):
+        status = data.get("status")
+        if subscription_id and status in ("canceled", "unpaid", "incomplete_expired"):
             for u, info in users.items():
                 if info.get("subscription_id") == subscription_id:
-                    # Do NOT downgrade immediately; set cancel date
-                    period_end = data["current_period_end"]
-                    users[u]["cancel_at"] = period_end
+                    # Set cancel timestamp to downgrade after period end
+                    users[u]["cancel_at"] = data.get("current_period_end")
                     save_users(users)
                     break
 
@@ -151,12 +146,11 @@ def get_status():
     if not user:
         return jsonify({"tier": "free"})
 
-    # Check expiration
+    # Auto-downgrade if expired
     exp = user.get("expires")
     if exp:
         exp_dt = datetime.strptime(exp, "%Y%m%d")
         if datetime.utcnow() > exp_dt:
-            # License expired → downgrade
             user["tier"] = "free"
             user.pop("license_key", None)
             user.pop("expires", None)
@@ -166,10 +160,11 @@ def get_status():
     return jsonify({
         "tier": user.get("tier", "free"),
         "license_key": user.get("license_key", ""),
-        "expires": user.get("expires", "")
+        "expires": user.get("expires", ""),
+        "cancel_at": user.get("cancel_at", None)
     })
 
-# --- 7️⃣ Billing portal (user cancels subscription easily) ---
+# --- 7️⃣ Cancel / billing portal ---
 @app.route("/cancel_subscription", methods=["POST"])
 def cancel_subscription():
     username = request.json.get("username")
@@ -179,12 +174,15 @@ def cancel_subscription():
     if not user or "customer_id" not in user:
         return jsonify({"error": "User not found"}), 404
 
-    session = stripe.billing_portal.Session.create(
-        customer=user["customer_id"],
-        return_url=BILLING_PORTAL_RETURN_URL
-    )
-
-    return jsonify({"portal_url": session.url})
+    try:
+        # Create Stripe billing portal session
+        session = stripe.billing_portal.Session.create(
+            customer=user["customer_id"],
+            return_url=BILLING_PORTAL_RETURN_URL
+        )
+        return jsonify({"portal_url": session.url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # --- 8️⃣ Run ---
 if __name__ == "__main__":

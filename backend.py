@@ -24,7 +24,10 @@ def load_users():
         return {}
 
 def save_users(u):
-    json.dump(u, open(USERS_FILE, "w"), indent=2)
+    try:
+        json.dump(u, open(USERS_FILE, "w"), indent=2)
+    except Exception as e:
+        print(f"Error saving users.json: {e}")
 
 # --- 3️⃣ License generator ---
 def gen_license(tier):
@@ -74,16 +77,15 @@ def webhook():
 
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
-    except:
+    except Exception as e:
+        print(f"Webhook signature error: {e}")
         return "Bad signature", 400
 
     event_type = event["type"]
     data = event["data"]["object"]
     users = load_users()
 
-    # --------------------------
     # INITIAL PAYMENT UPGRADE
-    # --------------------------
     if event_type in ("checkout.session.completed",
                       "checkout.session.async_payment_succeeded"):
         sess_id = data["id"]
@@ -102,11 +104,10 @@ def webhook():
                     "customer_id": customer_id
                 }
                 save_users(users)
+                print(f"[Webhook] Checkout completed for {u}, tier {tier}")
                 break
 
-    # --------------------------
     # RECURRING MONTHLY RENEWAL
-    # --------------------------
     if event_type in ("invoice.paid", "invoice.payment_succeeded"):
         subscription_id = data.get("subscription")
         if subscription_id:
@@ -117,21 +118,25 @@ def webhook():
                     users[u]["license_key"] = lic
                     users[u]["expires"] = exp
                     save_users(users)
+                    print(f"[Webhook] Subscription renewed for {u}, tier {tier}")
                     break
 
-    # --------------------------
-    # SUBSCRIPTION CANCELED
-    # --------------------------
+    # SUBSCRIPTION CANCELED / UPDATED
     if event_type in ("customer.subscription.deleted",
                       "customer.subscription.updated"):
         subscription_id = data.get("id")
         status = data.get("status")
-        if subscription_id and status in ("canceled", "unpaid", "incomplete_expired"):
+        cancel_at_period_end = data.get("cancel_at_period_end")
+        current_period_end = data.get("current_period_end")
+
+        if subscription_id:
             for u, info in users.items():
                 if info.get("subscription_id") == subscription_id:
-                    # Set cancel timestamp to downgrade after period end
-                    users[u]["cancel_at"] = data.get("current_period_end")
-                    save_users(users)
+                    # Set cancel_at timestamp if subscription canceled or set to cancel at period end
+                    if status in ("canceled", "unpaid", "incomplete_expired") or cancel_at_period_end:
+                        users[u]["cancel_at"] = current_period_end
+                        save_users(users)
+                        print(f"[Webhook] Subscription set to cancel for {u}, status {status}, cancel_at {current_period_end}")
                     break
 
     return "", 200
@@ -149,7 +154,14 @@ def get_status():
     # Auto-downgrade if expired
     exp = user.get("expires")
     if exp:
-        exp_dt = datetime.strptime(exp, "%Y%m%d")
+        try:
+            if "-" in exp:
+                exp_dt = datetime.strptime(exp, "%Y-%m-%d")
+            else:
+                exp_dt = datetime.strptime(exp, "%Y%m%d")
+        except:
+            exp_dt = datetime.utcnow() - timedelta(days=1)
+
         if datetime.utcnow() > exp_dt:
             user["tier"] = "free"
             user.pop("license_key", None)
@@ -175,7 +187,6 @@ def cancel_subscription():
         return jsonify({"error": "User not found"}), 404
 
     try:
-        # Create Stripe billing portal session
         session = stripe.billing_portal.Session.create(
             customer=user["customer_id"],
             return_url=BILLING_PORTAL_RETURN_URL

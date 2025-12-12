@@ -136,12 +136,12 @@ def webhook():
                 tier = data.get("pending_tier")
                 if not tier:
                     return False
-                # Generate license for 30 days
                 license_key = generate_license(tier, 30)
                 expiry_date = (datetime.utcnow() + timedelta(days=30)).strftime("%Y-%m-%d")
                 users[username]["tier"] = tier
                 users[username]["license_key"] = license_key
                 users[username]["expires"] = expiry_date
+                # Remove temporary session info
                 users[username].pop("pending_tier", None)
                 users[username].pop("checkout_session_id", None)
                 save_users(users)
@@ -150,17 +150,15 @@ def webhook():
 
     evt_type = event.get("type")
 
-    # Only upgrade after Stripe confirms payment
+    # ✅ Handle checkout session completed
     if evt_type == "checkout.session.completed":
         session = event["data"]["object"]
         session_id = session.get("id")
         payment_status = session.get("payment_status")
         subscription_id = session.get("subscription")
 
-        # Paid checkout session
         if payment_status == "paid":
             upgrade_user(session_id)
-        # If subscription exists but not paid yet, wait for invoice.paid
         elif subscription_id:
             sub = stripe.Subscription.retrieve(subscription_id, expand=["latest_invoice"])
             latest_invoice = sub.get("latest_invoice")
@@ -168,7 +166,7 @@ def webhook():
                 upgrade_user(session_id)
         return "", 200
 
-    # Invoice events for subscription payments
+    # ✅ Handle invoice events
     if evt_type in ("invoice.paid", "invoice.payment_succeeded"):
         invoice = event["data"]["object"]
         checkout_session_id = invoice.get("checkout_session")
@@ -176,7 +174,7 @@ def webhook():
             upgrade_user(checkout_session_id)
         return "", 200
 
-    # Payment failed
+    # ✅ Payment failed (ignore)
     if evt_type in ("invoice.payment_failed",):
         return "", 200
 
@@ -203,21 +201,17 @@ def get_status():
 ###############################################################################
 @app.route("/health", methods=["GET"])
 def health():
-    ok = True
     missing = []
     if not stripe.api_key:
-        ok = False
         missing.append("stripe.api_key")
     if not WEBHOOK_SECRET:
-        ok = False
         missing.append("WEBHOOK_SECRET")
     if not LICENSE_SECRET:
-        ok = False
         missing.append("LICENSE_SECRET")
     return jsonify({
-        "status": "ok" if ok else "error",
+        "status": "ok" if not missing else "error",
         "loaded_env": {
-            "stripe_key_preview": (stripe.api_key[:6] + "..." + stripe.api_key[-4:]),
+            "stripe_key_preview": stripe.api_key[:6] + "..." + stripe.api_key[-4:],
             "price_pro": TIER_PRICE_IDS.get("pro"),
             "price_diamond": TIER_PRICE_IDS.get("diamond")
         },

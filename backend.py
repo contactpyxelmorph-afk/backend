@@ -121,14 +121,25 @@ def webhook():
 # --- STATUS ---
 @app.route("/get_status", methods=["GET"])
 def get_status():
-    user = load_users().get(request.args.get("user"))
+    username = request.args.get("user")
+    users = load_users()
+    user = users.get(username)
+
+    # No record → FREE
     if not user:
         return jsonify({"tier": "free"})
 
-    exp = user.get("expires")
-    if exp:
-        if datetime.utcnow() > datetime.strptime(exp, "%Y%m%d"):
+    # Incomplete / pending / corrupted record → FREE
+    if "tier" not in user or "license_key" not in user or "expires" not in user:
+        return jsonify({"tier": "free"})
+
+    # Expiry check
+    try:
+        exp_dt = datetime.strptime(user["expires"], "%Y%m%d")
+        if datetime.utcnow() > exp_dt:
             return jsonify({"tier": "free"})
+    except Exception:
+        return jsonify({"tier": "free"})
 
     return jsonify({
         "tier": user["tier"],

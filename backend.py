@@ -2,8 +2,9 @@ from flask import Flask, request, jsonify
 import os, hashlib, base64
 from datetime import datetime, timedelta
 import stripe
-import psycopg  # psycopg v3
+import psycopg
 from psycopg.rows import dict_row
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -23,7 +24,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set!")
 
 def get_db_connection():
-    """Return psycopg connection with dict rows"""
+    """Return a psycopg connection with dict rows"""
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 # --- USERS STORAGE ---
@@ -40,7 +41,7 @@ def load_all_users():
             return cur.fetchall()
 
 def upsert_user(user):
-    """Insert or update user data"""
+    """Insert or update user in the database"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -60,7 +61,7 @@ def upsert_user(user):
                 user.get("username"),
                 user.get("tier", "free"),
                 user.get("license_key"),
-                user.get("expires"),  # should be date object or None
+                user.get("expires"),
                 user.get("customer_id"),
                 user.get("subscription_id"),
                 user.get("cancel_at"),
@@ -71,13 +72,13 @@ def upsert_user(user):
 
 # --- LICENSE ---
 def gen_license(tier):
-    """Generate license key and expiration date"""
+    """Generate license key and expiration date (date object)"""
     exp_date = (datetime.utcnow() + timedelta(days=30)).date()
     sig = hashlib.sha256(f"{tier}|{exp_date.isoformat()}|{LICENSE_SECRET}".encode()).hexdigest()
     lic = base64.urlsafe_b64encode(f"{tier}|{exp_date.isoformat()}|{sig}".encode()).decode()
     return lic, exp_date
 
-# --- CHECKOUT ---
+# --- CHECKOUT SESSION ---
 @app.route("/create_checkout_session", methods=["POST"])
 def create_checkout():
     data = request.json
@@ -90,15 +91,18 @@ def create_checkout():
     if not price_id:
         return jsonify({"error": f"Price ID for tier {tier} not set"}), 500
 
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": price_id, "quantity": 1}],
-        success_url=os.getenv("SUCCESS_URL"),
-        cancel_url=os.getenv("CANCEL_URL"),
-        metadata={"username": username, "tier": tier}
-    )
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=os.getenv("SUCCESS_URL"),
+            cancel_url=os.getenv("CANCEL_URL"),
+            metadata={"username": username, "tier": tier}
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    # Store pending checkout
+    # Store pending checkout in DB
     upsert_user({
         "username": username,
         "tier": tier,
@@ -113,11 +117,12 @@ def create_checkout():
 
     return jsonify({"checkout_url": session.url})
 
-# --- WEBHOOK ---
+# --- STRIPE WEBHOOK ---
 @app.route("/webhook", methods=["POST"])
 def webhook():
     payload = request.data
     sig = request.headers.get("stripe-signature")
+
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
     except Exception:
@@ -126,7 +131,7 @@ def webhook():
     et = event["type"]
     obj = event["data"]["object"]
 
-    # --- CHECKOUT SESSION COMPLETED ---
+    # --- Checkout session completed ---
     if et == "checkout.session.completed":
         username = obj["metadata"].get("username")
         tier = obj["metadata"].get("tier")
@@ -144,7 +149,7 @@ def webhook():
                 "pending_tier": None
             })
 
-    # --- INVOICE PAYMENT SUCCEEDED ---
+    # --- Invoice payment succeeded (renewal) ---
     if et == "invoice.payment_succeeded":
         sub_id = obj.get("subscription")
         for info in load_all_users():
@@ -153,9 +158,9 @@ def webhook():
                 upsert_user({**info, "license_key": lic, "expires": exp})
                 break
 
-    # --- SUBSCRIPTION CANCELLED/UPDATED ---
+    # --- Subscription updated or deleted (cancellation) ---
     if et in ("customer.subscription.updated", "customer.subscription.deleted"):
-        sub_id = obj.get("id")
+        sub_id = obj["id"]
         status = obj.get("status")
         if status in ("canceled", "unpaid", "incomplete_expired"):
             for info in load_all_users():
@@ -167,17 +172,19 @@ def webhook():
 
     return "", 200
 
-# --- GET STATUS ---
+# --- STATUS ---
 @app.route("/get_status", methods=["GET"])
 def get_status():
     username = request.args.get("user")
     user = load_user(username)
-
     if not user or "tier" not in user or "license_key" not in user or "expires" not in user:
         return jsonify({"tier": "free"})
 
-    exp_date = user["expires"]  # already a date from psycopg
-    if not exp_date or datetime.utcnow().date() > exp_date:
+    try:
+        exp_date = user["expires"]
+        if datetime.utcnow().date() > exp_date:
+            return jsonify({"tier": "free"})
+    except Exception:
         return jsonify({"tier": "free"})
 
     return jsonify({

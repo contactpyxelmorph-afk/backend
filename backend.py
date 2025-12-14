@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 import stripe
 import psycopg  # psycopg v3
 from psycopg.rows import dict_row
-from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -23,24 +22,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set!")
 
-# Parse DATABASE_URL
-url = urlparse(DATABASE_URL)
-DB_NAME = url.path[1:]  # skip leading /
-DB_USER = url.username
-DB_PASS = url.password
-DB_HOST = url.hostname
-DB_PORT = url.port or 5432
-
 def get_db_connection():
-    """Return a psycopg connection with dict rows."""
-    return psycopg.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS,
-        row_factory=dict_row
-    )
+    """Return a psycopg connection with dict rows"""
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 # --- USERS STORAGE ---
 def load_user(username):
@@ -75,7 +59,7 @@ def upsert_user(user):
                 user.get("username"),
                 user.get("tier", "free"),
                 user.get("license_key"),
-                user.get("expires"),
+                user.get("expires"),  # must be datetime.date or None
                 user.get("customer_id"),
                 user.get("subscription_id"),
                 user.get("cancel_at"),
@@ -86,10 +70,11 @@ def upsert_user(user):
 
 # --- LICENSE ---
 def gen_license(tier):
-    exp = (datetime.utcnow() + timedelta(days=30)).strftime("%Y%m%d")
-    sig = hashlib.sha256(f"{tier}|{exp}|{LICENSE_SECRET}".encode()).hexdigest()
-    lic = base64.urlsafe_b64encode(f"{tier}|{exp}|{sig}".encode()).decode()
-    return lic, exp
+    """Generate license key and expiration date (date object)"""
+    exp_date = (datetime.utcnow() + timedelta(days=30)).date()  # store as date
+    sig = hashlib.sha256(f"{tier}|{exp_date.isoformat()}|{LICENSE_SECRET}".encode()).hexdigest()
+    lic = base64.urlsafe_b64encode(f"{tier}|{exp_date.isoformat()}|{sig}".encode()).decode()
+    return lic, exp_date
 
 # --- CHECKOUT ---
 @app.route("/create_checkout_session", methods=["POST"])
@@ -99,9 +84,11 @@ def create_checkout():
     tier = data.get("tier")
 
     if not username or not tier:
-        return jsonify({"error": "Missing"}), 400
+        return jsonify({"error": "Missing username or tier"}), 400
 
     price_id = os.getenv(f"PRICE_{tier.upper()}_ID")
+    if not price_id:
+        return jsonify({"error": f"Price ID for tier {tier} not set"}), 500
 
     session = stripe.checkout.Session.create(
         mode="subscription",
@@ -111,7 +98,7 @@ def create_checkout():
         metadata={"username": username, "tier": tier}
     )
 
-    # Store pending checkout
+    # Store pending checkout in DB
     upsert_user({
         "username": username,
         "tier": tier,
@@ -140,7 +127,7 @@ def webhook():
     et = event["type"]
     obj = event["data"]["object"]
 
-    # PAYMENT CONFIRMED
+    # Checkout completed → activate subscription
     if et == "checkout.session.completed":
         username = obj["metadata"].get("username")
         tier = obj["metadata"].get("tier")
@@ -158,33 +145,25 @@ def webhook():
                 "pending_tier": None
             })
 
-    # MONTHLY RENEWAL
+    # Invoice payment succeeded → extend subscription
     if et == "invoice.payment_succeeded":
         sub_id = obj.get("subscription")
-        users = load_all_users()
-        for info in users:
+        for info in load_all_users():
             if info.get("subscription_id") == sub_id:
                 lic, exp = gen_license(info["tier"])
-                upsert_user({
-                    **info,
-                    "license_key": lic,
-                    "expires": exp
-                })
+                upsert_user({**info, "license_key": lic, "expires": exp})
                 break
 
-    # CANCELLATION
+    # Subscription cancelled or updated → mark cancel_at
     if et in ("customer.subscription.updated", "customer.subscription.deleted"):
         sub_id = obj["id"]
-        status = obj["status"]
+        status = obj.get("status")
         if status in ("canceled", "unpaid", "incomplete_expired"):
-            users = load_all_users()
-            for info in users:
+            for info in load_all_users():
                 if info.get("subscription_id") == sub_id:
-                    cancel_at = obj.get("current_period_end")
-                    upsert_user({
-                        **info,
-                        "cancel_at": datetime.utcfromtimestamp(cancel_at) if cancel_at else None
-                    })
+                    cancel_at_ts = obj.get("current_period_end")
+                    cancel_at = datetime.utcfromtimestamp(cancel_at_ts) if cancel_at_ts else None
+                    upsert_user({**info, "cancel_at": cancel_at})
                     break
 
     return "", 200
@@ -199,8 +178,8 @@ def get_status():
         return jsonify({"tier": "free"})
 
     try:
-        exp_dt = datetime.strptime(user["expires"], "%Y%m%d")
-        if datetime.utcnow() > exp_dt:
+        exp_date = user["expires"]  # already a date
+        if datetime.utcnow().date() > exp_date:
             return jsonify({"tier": "free"})
     except Exception:
         return jsonify({"tier": "free"})
@@ -208,7 +187,7 @@ def get_status():
     return jsonify({
         "tier": user["tier"],
         "license_key": user["license_key"],
-        "expires": user["expires"],
+        "expires": exp_date.isoformat(),
         "cancel_at": user.get("cancel_at")
     })
 

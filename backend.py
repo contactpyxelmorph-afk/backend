@@ -2,8 +2,8 @@ from flask import Flask, request, jsonify
 import os, hashlib, base64
 from datetime import datetime, timedelta
 import stripe
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg  # <-- changed from psycopg2
+from psycopg.rows import dict_row  # new for RealDictCursor equivalent
 
 app = Flask(__name__)
 
@@ -25,63 +25,57 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 
 def get_db_connection():
-    return psycopg2.connect(
+    # psycopg v3 connection; autocommit is optional
+    return psycopg.connect(
         host=DB_HOST,
         port=DB_PORT,
         dbname=DB_NAME,
         user=DB_USER,
-        password=DB_PASS
+        password=DB_PASS,
+        row_factory=dict_row  # returns dicts like RealDictCursor
     )
 
 # --- USERS STORAGE ---
 def load_user(username):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM users WHERE username = %s", (username,))
-    user = cur.fetchone()
-    cur.close()
-    conn.close()
-    return user
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+            return cur.fetchone()
 
 def load_all_users():
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM users")
-    users = cur.fetchall()
-    cur.close()
-    conn.close()
-    return users
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users")
+            return cur.fetchall()
 
 def upsert_user(user):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO users (username, tier, license_key, expires, customer_id, subscription_id, cancel_at, pending_checkout, pending_tier)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (username)
-        DO UPDATE SET
-            tier = EXCLUDED.tier,
-            license_key = EXCLUDED.license_key,
-            expires = EXCLUDED.expires,
-            customer_id = EXCLUDED.customer_id,
-            subscription_id = EXCLUDED.subscription_id,
-            cancel_at = EXCLUDED.cancel_at,
-            pending_checkout = EXCLUDED.pending_checkout,
-            pending_tier = EXCLUDED.pending_tier
-    """, (
-        user.get("username"),
-        user.get("tier", "free"),
-        user.get("license_key"),
-        user.get("expires"),
-        user.get("customer_id"),
-        user.get("subscription_id"),
-        user.get("cancel_at"),
-        user.get("pending_checkout"),
-        user.get("pending_tier")
-    ))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (username, tier, license_key, expires, customer_id, subscription_id, cancel_at, pending_checkout, pending_tier)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (username)
+                DO UPDATE SET
+                    tier = EXCLUDED.tier,
+                    license_key = EXCLUDED.license_key,
+                    expires = EXCLUDED.expires,
+                    customer_id = EXCLUDED.customer_id,
+                    subscription_id = EXCLUDED.subscription_id,
+                    cancel_at = EXCLUDED.cancel_at,
+                    pending_checkout = EXCLUDED.pending_checkout,
+                    pending_tier = EXCLUDED.pending_tier
+            """, (
+                user.get("username"),
+                user.get("tier", "free"),
+                user.get("license_key"),
+                user.get("expires"),
+                user.get("customer_id"),
+                user.get("subscription_id"),
+                user.get("cancel_at"),
+                user.get("pending_checkout"),
+                user.get("pending_tier")
+            ))
+        conn.commit()
 
 # --- LICENSE ---
 def gen_license(tier):
@@ -133,13 +127,13 @@ def webhook():
 
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
-    except:
+    except Exception:
         return "Invalid signature", 400
 
     et = event["type"]
     obj = event["data"]["object"]
 
-    # ✅ PAYMENT CONFIRMED — ACTIVATE SUBSCRIPTION
+    # PAYMENT CONFIRMED — ACTIVATE SUBSCRIPTION
     if et == "checkout.session.completed":
         username = obj["metadata"].get("username")
         tier = obj["metadata"].get("tier")
@@ -157,7 +151,7 @@ def webhook():
                 "pending_tier": None
             })
 
-    # 🔁 MONTHLY RENEWAL
+    # MONTHLY RENEWAL
     if et == "invoice.payment_succeeded":
         sub_id = obj.get("subscription")
         users = load_all_users()
@@ -171,7 +165,7 @@ def webhook():
                 })
                 break
 
-    # ❌ CANCELLATION (END OF PERIOD)
+    # CANCELLATION (END OF PERIOD)
     if et in ("customer.subscription.updated", "customer.subscription.deleted"):
         sub_id = obj["id"]
         status = obj["status"]
@@ -194,15 +188,9 @@ def get_status():
     username = request.args.get("user")
     user = load_user(username)
 
-    # No record → FREE
-    if not user:
+    if not user or "tier" not in user or "license_key" not in user or "expires" not in user:
         return jsonify({"tier": "free"})
 
-    # Incomplete / pending / corrupted → FREE
-    if "tier" not in user or "license_key" not in user or "expires" not in user:
-        return jsonify({"tier": "free"})
-
-    # Expiry check
     try:
         exp_dt = datetime.strptime(user["expires"], "%Y%m%d")
         if datetime.utcnow() > exp_dt:

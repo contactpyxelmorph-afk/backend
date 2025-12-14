@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 import stripe
 import psycopg
 from psycopg.rows import dict_row
-from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -102,7 +101,6 @@ def create_checkout():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Store pending checkout in DB
     upsert_user({
         "username": username,
         "tier": tier,
@@ -122,7 +120,6 @@ def create_checkout():
 def webhook():
     payload = request.data
     sig = request.headers.get("stripe-signature")
-
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
     except Exception:
@@ -131,7 +128,7 @@ def webhook():
     et = event["type"]
     obj = event["data"]["object"]
 
-    # --- Checkout session completed ---
+    # Checkout completed → activate subscription
     if et == "checkout.session.completed":
         username = obj["metadata"].get("username")
         tier = obj["metadata"].get("tier")
@@ -149,7 +146,7 @@ def webhook():
                 "pending_tier": None
             })
 
-    # --- Invoice payment succeeded (renewal) ---
+    # Invoice payment succeeded → extend subscription
     if et == "invoice.payment_succeeded":
         sub_id = obj.get("subscription")
         for info in load_all_users():
@@ -158,7 +155,7 @@ def webhook():
                 upsert_user({**info, "license_key": lic, "expires": exp})
                 break
 
-    # --- Subscription updated or deleted (cancellation) ---
+    # Subscription cancelled → mark cancel_at
     if et in ("customer.subscription.updated", "customer.subscription.deleted"):
         sub_id = obj["id"]
         status = obj.get("status")

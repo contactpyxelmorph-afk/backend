@@ -20,7 +20,6 @@ REQUIRED_ENV = [
     "LICENSE_SECRET",
     "DATABASE_URL",
     "SUCCESS_URL",
-    "CANCEL_URL",
 ]
 
 for key in REQUIRED_ENV:
@@ -42,7 +41,7 @@ def get_db_connection():
     )
 
 # =========================================================
-# DATE / EXPIRY CONTRACT (SINGLE SOURCE OF TRUTH)
+# DATE / EXPIRY CONTRACT
 # =========================================================
 
 def date_to_yyyymmdd(d: date) -> str:
@@ -105,7 +104,7 @@ def upsert_user(u):
             u["username"],
             u.get("tier", "free"),
             u.get("license_key"),
-            u.get("expires"),        # DATE OR NULL (DB ONLY)
+            u.get("expires"),
             u.get("customer_id"),
             u.get("subscription_id"),
             u.get("cancel_at"),
@@ -135,7 +134,7 @@ def create_checkout():
         mode="subscription",
         line_items=[{"price": price_id, "quantity": 1}],
         success_url=os.getenv("SUCCESS_URL"),
-        cancel_url=os.getenv("CANCEL_URL"),
+        cancel_url=os.getenv("SUCCESS_URL"),  # no separate cancel page needed
         metadata={"username": username, "tier": tier},
     )
 
@@ -165,10 +164,10 @@ def webhook():
     obj = event["data"]["object"]
     et = event["type"]
 
+    # Checkout completed → activate subscription
     if et == "checkout.session.completed":
         username = obj["metadata"].get("username")
         tier = obj["metadata"].get("tier")
-
         if username and tier:
             lic, exp_date, _ = gen_license(tier)
             upsert_user({
@@ -182,22 +181,31 @@ def webhook():
                 "pending_tier": None,
             })
 
+    # Invoice payment succeeded → extend subscription
     if et == "invoice.payment_succeeded":
         sub_id = obj.get("subscription")
         for u in load_all_users():
             if u["subscription_id"] == sub_id:
                 lic, exp_date, _ = gen_license(u["tier"])
-                upsert_user({
-                    **u,
-                    "license_key": lic,
-                    "expires": exp_date,
-                })
+                upsert_user({**u, "license_key": lic, "expires": exp_date})
                 break
+
+    # Subscription cancelled/updated → mark cancel_at
+    if et in ("customer.subscription.updated", "customer.subscription.deleted"):
+        sub_id = obj["id"]
+        status = obj.get("status")
+        if status in ("canceled", "unpaid", "incomplete_expired"):
+            for u in load_all_users():
+                if u["subscription_id"] == sub_id:
+                    cancel_at_ts = obj.get("current_period_end")
+                    cancel_at = datetime.utcfromtimestamp(cancel_at_ts) if cancel_at_ts else None
+                    upsert_user({**u, "cancel_at": cancel_at})
+                    break
 
     return "", 200
 
 # =========================================================
-# STATUS — APP-SAFE OUTPUT ONLY
+# STATUS
 # =========================================================
 
 @app.route("/get_status", methods=["GET"])
@@ -215,9 +223,27 @@ def get_status():
     return jsonify({
         "tier": user["tier"],
         "license_key": user["license_key"],
-        "expires": date_to_yyyymmdd(exp_date),  # 🔒 CONTRACT ENFORCED
+        "expires": date_to_yyyymmdd(exp_date),
         "cancel_at": user.get("cancel_at"),
     })
+
+# =========================================================
+# STRIPE PORTAL — CANCEL SUBSCRIPTION WITHOUT CUSTOM PAGE
+# =========================================================
+
+@app.route("/cancel_subscription", methods=["POST"])
+def cancel_subscription():
+    username = request.json.get("username")
+    user = load_user(username)
+    if not user or not user.get("customer_id"):
+        return jsonify({"error": "No active subscription"}), 400
+
+    portal = stripe.billing_portal.Session.create(
+        customer=user["customer_id"],
+        configuration=os.getenv("BILLING_PORTAL_CONFIG_ID"),
+        return_url=os.getenv("SUCCESS_URL")  # redirect after portal close
+    )
+    return jsonify({"portal_url": portal.url})
 
 # =========================================================
 # RUN

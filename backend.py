@@ -2,8 +2,9 @@ from flask import Flask, request, jsonify
 import os, hashlib, base64
 from datetime import datetime, timedelta
 import stripe
-import psycopg  # <-- changed from psycopg2
-from psycopg.rows import dict_row  # new for RealDictCursor equivalent
+import psycopg  # psycopg v3
+from psycopg.rows import dict_row
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -18,21 +19,27 @@ BILLING_PORTAL_RETURN_URL = os.getenv("BILLING_PORTAL_RETURN_URL")
 BILLING_PORTAL_CONFIG_ID = os.getenv("BILLING_PORTAL_CONFIG_ID")
 
 # --- DATABASE ---
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = int(os.getenv("DB_PORT", 5432))
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASS = os.getenv("DB_PASS")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set!")
+
+# Parse DATABASE_URL
+url = urlparse(DATABASE_URL)
+DB_NAME = url.path[1:]  # skip leading /
+DB_USER = url.username
+DB_PASS = url.password
+DB_HOST = url.hostname
+DB_PORT = url.port or 5432
 
 def get_db_connection():
-    # psycopg v3 connection; autocommit is optional
+    """Return a psycopg connection with dict rows."""
     return psycopg.connect(
         host=DB_HOST,
         port=DB_PORT,
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASS,
-        row_factory=dict_row  # returns dicts like RealDictCursor
+        row_factory=dict_row
     )
 
 # --- USERS STORAGE ---
@@ -104,7 +111,7 @@ def create_checkout():
         metadata={"username": username, "tier": tier}
     )
 
-    # Store pending checkout in DB
+    # Store pending checkout
     upsert_user({
         "username": username,
         "tier": tier,
@@ -133,7 +140,7 @@ def webhook():
     et = event["type"]
     obj = event["data"]["object"]
 
-    # PAYMENT CONFIRMED — ACTIVATE SUBSCRIPTION
+    # PAYMENT CONFIRMED
     if et == "checkout.session.completed":
         username = obj["metadata"].get("username")
         tier = obj["metadata"].get("tier")
@@ -165,7 +172,7 @@ def webhook():
                 })
                 break
 
-    # CANCELLATION (END OF PERIOD)
+    # CANCELLATION
     if et in ("customer.subscription.updated", "customer.subscription.deleted"):
         sub_id = obj["id"]
         status = obj["status"]

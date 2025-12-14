@@ -1,7 +1,9 @@
 from flask import Flask, request, jsonify
-import json, os, hashlib, base64
+import os, hashlib, base64
 from datetime import datetime, timedelta
 import stripe
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 
@@ -12,19 +14,74 @@ if not os.getenv("RENDER"):
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY_LIVE")
 WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 LICENSE_SECRET = os.getenv("LICENSE_SECRET")
-USERS_FILE = "users.json"
 BILLING_PORTAL_RETURN_URL = os.getenv("BILLING_PORTAL_RETURN_URL")
 BILLING_PORTAL_CONFIG_ID = os.getenv("BILLING_PORTAL_CONFIG_ID")
 
-# --- USERS STORAGE ---
-def load_users():
-    try:
-        return json.load(open(USERS_FILE))
-    except:
-        return {}
+# --- DATABASE ---
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = int(os.getenv("DB_PORT", 5432))
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
 
-def save_users(users):
-    json.dump(users, open(USERS_FILE, "w"), indent=2)
+def get_db_connection():
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS
+    )
+
+# --- USERS STORAGE ---
+def load_user(username):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+    return user
+
+def load_all_users():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM users")
+    users = cur.fetchall()
+    cur.close()
+    conn.close()
+    return users
+
+def upsert_user(user):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (username, tier, license_key, expires, customer_id, subscription_id, cancel_at, pending_checkout, pending_tier)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (username)
+        DO UPDATE SET
+            tier = EXCLUDED.tier,
+            license_key = EXCLUDED.license_key,
+            expires = EXCLUDED.expires,
+            customer_id = EXCLUDED.customer_id,
+            subscription_id = EXCLUDED.subscription_id,
+            cancel_at = EXCLUDED.cancel_at,
+            pending_checkout = EXCLUDED.pending_checkout,
+            pending_tier = EXCLUDED.pending_tier
+    """, (
+        user.get("username"),
+        user.get("tier", "free"),
+        user.get("license_key"),
+        user.get("expires"),
+        user.get("customer_id"),
+        user.get("subscription_id"),
+        user.get("cancel_at"),
+        user.get("pending_checkout"),
+        user.get("pending_tier")
+    ))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 # --- LICENSE ---
 def gen_license(tier):
@@ -53,12 +110,18 @@ def create_checkout():
         metadata={"username": username, "tier": tier}
     )
 
-    users = load_users()
-    users[username] = {
+    # Store pending checkout in DB
+    upsert_user({
+        "username": username,
+        "tier": tier,
+        "license_key": None,
+        "expires": None,
+        "customer_id": None,
+        "subscription_id": None,
+        "cancel_at": None,
         "pending_checkout": session.id,
         "pending_tier": tier
-    }
-    save_users(users)
+    })
 
     return jsonify({"checkout_url": session.url})
 
@@ -75,45 +138,52 @@ def webhook():
 
     et = event["type"]
     obj = event["data"]["object"]
-    users = load_users()
 
     # ✅ PAYMENT CONFIRMED — ACTIVATE SUBSCRIPTION
     if et == "checkout.session.completed":
         username = obj["metadata"].get("username")
         tier = obj["metadata"].get("tier")
-
         if username and tier:
             lic, exp = gen_license(tier)
-            users[username] = {
+            upsert_user({
+                "username": username,
                 "tier": tier,
                 "license_key": lic,
                 "expires": exp,
                 "customer_id": obj["customer"],
-                "subscription_id": obj["subscription"]
-            }
-            save_users(users)
+                "subscription_id": obj["subscription"],
+                "cancel_at": None,
+                "pending_checkout": None,
+                "pending_tier": None
+            })
 
     # 🔁 MONTHLY RENEWAL
     if et == "invoice.payment_succeeded":
         sub_id = obj.get("subscription")
-        for info in users.values():
+        users = load_all_users()
+        for info in users:
             if info.get("subscription_id") == sub_id:
                 lic, exp = gen_license(info["tier"])
-                info["license_key"] = lic
-                info["expires"] = exp
-                save_users(users)
+                upsert_user({
+                    **info,
+                    "license_key": lic,
+                    "expires": exp
+                })
                 break
 
     # ❌ CANCELLATION (END OF PERIOD)
     if et in ("customer.subscription.updated", "customer.subscription.deleted"):
         sub_id = obj["id"]
         status = obj["status"]
-
         if status in ("canceled", "unpaid", "incomplete_expired"):
-            for info in users.values():
+            users = load_all_users()
+            for info in users:
                 if info.get("subscription_id") == sub_id:
-                    info["cancel_at"] = obj["current_period_end"]
-                    save_users(users)
+                    cancel_at = obj.get("current_period_end")
+                    upsert_user({
+                        **info,
+                        "cancel_at": datetime.utcfromtimestamp(cancel_at) if cancel_at else None
+                    })
                     break
 
     return "", 200
@@ -122,14 +192,13 @@ def webhook():
 @app.route("/get_status", methods=["GET"])
 def get_status():
     username = request.args.get("user")
-    users = load_users()
-    user = users.get(username)
+    user = load_user(username)
 
     # No record → FREE
     if not user:
         return jsonify({"tier": "free"})
 
-    # Incomplete / pending / corrupted record → FREE
+    # Incomplete / pending / corrupted → FREE
     if "tier" not in user or "license_key" not in user or "expires" not in user:
         return jsonify({"tier": "free"})
 
@@ -152,7 +221,7 @@ def get_status():
 @app.route("/cancel_subscription", methods=["POST"])
 def cancel_subscription():
     username = request.json.get("username")
-    user = load_users().get(username)
+    user = load_user(username)
 
     if not user or not user.get("customer_id"):
         return jsonify({"error": "No active subscription"}), 400

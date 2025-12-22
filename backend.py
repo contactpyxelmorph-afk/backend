@@ -54,8 +54,12 @@ def yyyymmdd_to_date(s: str) -> date:
 # LICENSE
 # =========================================================
 
-def gen_license(tier: str):
-    expiry_date = (datetime.utcnow() + timedelta(days=30)).date()
+def gen_license(tier: str, lifetime: bool = False):
+    if lifetime:
+        expiry_date = (datetime.utcnow() + timedelta(days=365 * 100)).date()
+    else:
+        expiry_date = (datetime.utcnow() + timedelta(days=30)).date()
+
     expiry_str = date_to_yyyymmdd(expiry_date)
 
     signature = hashlib.sha256(
@@ -66,6 +70,7 @@ def gen_license(tier: str):
     encoded = base64.urlsafe_b64encode(raw.encode()).decode()
 
     return encoded, expiry_date, expiry_str
+
 
 # =========================================================
 # USERS
@@ -166,29 +171,38 @@ def webhook():
 
     # Checkout completed → activate subscription
     if et == "checkout.session.completed":
-        username = obj["metadata"].get("username")
-        tier = obj["metadata"].get("tier")
-        if username and tier:
-            lic, exp_date, _ = gen_license(tier)
-            upsert_user({
-                "username": username,
-                "tier": tier,
-                "license_key": lic,
-                "expires": exp_date,
-                "customer_id": obj["customer"],
-                "subscription_id": obj["subscription"],
-                "pending_checkout": None,
-                "pending_tier": None,
-            })
+    username = obj["metadata"].get("username")
+    tier = obj["metadata"].get("tier")
+
+    # Stripe sets mode = "payment" for one-time (lifetime) purchases
+    is_lifetime = obj.get("mode") == "payment"
+
+    if username and tier:
+        lic, exp_date, _ = gen_license(tier, lifetime=is_lifetime)
+        upsert_user({
+            "username": username,
+            "tier": tier,
+            "license_key": lic,
+            "expires": exp_date,
+            "customer_id": obj.get("customer"),
+            "subscription_id": None if is_lifetime else obj.get("subscription"),
+            "pending_checkout": None,
+            "pending_tier": None,
+        })
+
 
     # Invoice payment succeeded → extend subscription
     if et == "invoice.payment_succeeded":
-        sub_id = obj.get("subscription")
-        for u in load_all_users():
-            if u["subscription_id"] == sub_id:
-                lic, exp_date, _ = gen_license(u["tier"])
-                upsert_user({**u, "license_key": lic, "expires": exp_date})
-                break
+    sub_id = obj.get("subscription")
+    if not sub_id:
+        return "", 200  # lifetime purchases never renew
+
+    for u in load_all_users():
+        if u["subscription_id"] == sub_id:
+            lic, exp_date, _ = gen_license(u["tier"])
+            upsert_user({**u, "license_key": lic, "expires": exp_date})
+            break
+
 
     # Subscription cancelled/updated → mark cancel_at
     if et in ("customer.subscription.updated", "customer.subscription.deleted"):

@@ -55,11 +55,10 @@ def yyyymmdd_to_date(s: str) -> date:
 # =========================================================
 
 def gen_license(tier: str, lifetime: bool = False):
-    if lifetime:
-        expiry_date = (datetime.utcnow() + timedelta(days=365 * 80)).date()
-    else:
-        expiry_date = (datetime.utcnow() + timedelta(days=30)).date()
-
+    # Determine days based on lifetime flag
+    days = 365 * 80 if lifetime else 30
+    expiry_date = (datetime.utcnow() + timedelta(days=days)).date()
+    
     expiry_str = date_to_yyyymmdd(expiry_date)
 
     signature = hashlib.sha256(
@@ -137,7 +136,7 @@ def create_checkout():
         return jsonify({"error": "Price ID not configured"}), 500
 
     session = stripe.checkout.Session.create(
-        mode="subscription",
+        mode="payment",
         line_items=[{"price": price_id, "quantity": 1}],
         success_url=os.getenv("SUCCESS_URL"),
         cancel_url=os.getenv("SUCCESS_URL"),  # no separate cancel page needed
